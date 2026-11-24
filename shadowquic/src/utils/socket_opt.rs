@@ -64,7 +64,14 @@ impl SocketFactory for UdpSocketFactory {
                 socket.bind(&bind_addr.into())?;
                 Ok(socket) as Result<Socket, io::Error>
             };
+            // A socket bound to a device takes the family of its destination. Windows
+            // refuses the IPv6 interface option on a device without IPv6 (the protocol
+            // switched off on the adapter), so a socket for both families could not
+            // reach an IPv4 server through it.
+            let bound_to_device =
+                matches!(self.interface, Some(Interface::Device(_))) && !addr.ip().is_loopback();
             if self.try_dual_stack
+                && !bound_to_device
                 && let Ok(socket) = try_create_dual_stack()
             {
                 tracing::trace!(
@@ -1020,5 +1027,45 @@ mod tests {
             tokio_socket.connect(target),
         )
         .await;
+    }
+
+    /// A device can be without IPv6: the protocol switched off on a Windows adapter.
+    /// Windows refuses the IPv6 interface option of a socket for both families there,
+    /// so an IPv4 server was out of reach through that device.
+    #[tokio::test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+    ))]
+    async fn a_device_bound_udp_socket_takes_the_family_of_its_destination() {
+        let iface = match get_default_interface_name() {
+            Some(name) => name,
+            None => return, // skip: no default interface found
+        };
+        let factory = UdpSocketFactory {
+            addr: "192.0.2.1:443".to_string(),
+            interface: Some(Interface::Device(iface.clone())),
+            fw_mark: None,
+            protect_path: None,
+            try_dual_stack: true,
+            resolver: test_resolver(),
+        };
+        let socket = match factory.create_socket().await {
+            Ok(socket) => socket,
+            // Linux without CAP_NET_RAW may refuse to bind to a device.
+            Err(error) if cfg!(not(any(target_os = "macos", target_os = "windows"))) => {
+                assert!(
+                    error.raw_os_error().is_some(),
+                    "unexpected error binding to device {iface}: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("binding to device {iface}: {error}"),
+        };
+        let local = socket.local_addr().unwrap().as_socket().unwrap();
+        assert!(local.is_ipv4(), "socket for an IPv4 server is {local}");
     }
 }

@@ -11,7 +11,7 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/shadowquic"
 SERVICE_FILE="/etc/systemd/system/shadowquic@.service"
 INSTANCE=server
-GITHUB_REPO="spongebob888/shadowquic"
+GITHUB_REPO="${GITHUB_REPO:-Shilmoon/shadowquic}"
 
 # Helper functions for logging
 log_info() {
@@ -81,7 +81,7 @@ install_binary() {
     local temp_dir
     temp_dir=$(mktemp -d)
     
-    if curl -L -o "$temp_dir/$APP_NAME" "$download_url"; then
+    if curl -fL -o "$temp_dir/$APP_NAME" "$download_url"; then
         log_success "Download successful."
     else
         log_error "Download failed."
@@ -149,7 +149,7 @@ setup_systemd() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=ShadowQuic Service
-Documentation=https://github.com/spongebob888/shadowquic
+Documentation=https://github.com/$GITHUB_REPO
 After=network-online.target
 Wants=network-online.target
 

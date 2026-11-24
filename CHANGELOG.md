@@ -24,6 +24,13 @@ Version links compare each release with the preceding tag.
 
 ### Fixed
 
+- UDP over stream no longer stops for the whole connection when one stream names a context id
+  the server never announces (an association it already ended on a failed destination): each
+  stream is read in its own task and gives up after 5 s. Before, every later UDP flow of that
+  connection got no answer until the client reconnected, while TCP kept working.
+- A UDP socket bound to a device has the address family of its destination instead of both
+  families: Windows refuses the IPv6 interface option on an adapter with IPv6 switched off
+  (error 10022), so a client bound to such an adapter could not reach an IPv4 server.
 - A handshake that stalls or fails no longer delays the connections queued behind it, for
   ShadowQUIC and SunnyQUIC inbounds (#206).
 - A ClientHello spanning several packets no longer fails the first 0-RTT connection (#191).

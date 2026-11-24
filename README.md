@@ -1,5 +1,27 @@
 # ![image](./logo.svg)
 
+> **This fork** is [spongebob888/shadowquic](https://github.com/spongebob888/shadowquic)
+> v0.4.12 with stability, memory and UDP fixes (branch `fixes-0.4.12`, list in
+> [CHANGELOG.md](CHANGELOG.md) under "Unreleased"). The wire protocol is unchanged: a server
+> from this fork works with stock clients (mihomo, NekoBox, Clash-rs, Elarni) and the other way round.
+> Most important for servers: UDP over stream no longer goes dead for a whole connection after
+> one failed destination, and peak memory under load is about 30-50 MB instead of 150-300 MB.
+>
+> Install a server from this fork (Linux x86_64 or aarch64, systemd, as root):
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/Shilmoon/shadowquic/fixes-0.4.12/scripts/linux_install.sh | bash
+> systemctl start shadowquic@server
+> ```
+>
+> It downloads the binary from this fork's latest
+> [release](https://github.com/Shilmoon/shadowquic/releases), writes `/etc/shadowquic/server.yaml`
+> with a random user (port 1443/udp, fake domain `cloudflare.com:443`; edit the file and
+> `systemctl restart shadowquic@server` to change them) and prints the login. Open the UDP port
+> in the firewall (`ufw allow 1443/udp`). To replace a stock binary that is already installed,
+> stop the service, download `shadowquic-x86_64-linux` from the release over
+> `/usr/local/bin/shadowquic` and start it again; the config stays as it is.
+
  A 0-RTT QUIC Proxy with SNI camouflage 
 
  - UDP Friendly with minimum header
