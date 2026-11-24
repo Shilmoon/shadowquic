@@ -69,9 +69,10 @@ pub struct VarVec {
 }
 
 impl From<Vec<u8>> for VarVec {
+    /// A content over 255 bytes has no valid length: encoding it fails.
     fn from(vec: Vec<u8>) -> Self {
         VarVec {
-            len: vec.len() as u8,
+            len: vec.len().min(u8::MAX as usize) as u8,
             contents: vec,
         }
     }
@@ -80,9 +81,13 @@ impl From<Vec<u8>> for VarVec {
 #[async_trait::async_trait]
 impl SEncode for VarVec {
     async fn encode<T: AsyncWrite + Unpin + Send>(&self, s: &mut T) -> Result<(), SError> {
-        let buf = vec![self.len];
-        s.write_all(&buf).await?;
-        s.write_all(&self.contents[0..self.len as usize]).await?;
+        // The length byte must describe what follows it: a longer content
+        // (a name over 255 bytes) would otherwise go out cut short.
+        if self.contents.len() != self.len as usize {
+            return Err(SError::ProtocolViolation);
+        }
+        s.write_all(&[self.len]).await?;
+        s.write_all(&self.contents).await?;
         Ok(())
     }
 }
@@ -120,6 +125,14 @@ pub struct SocksAddr {
     pub port: u16,
 }
 impl SocksAddr {
+    /// Whether the address can be written: a name over 255 bytes cannot.
+    pub(crate) fn is_encodable(&self) -> bool {
+        match &self.addr {
+            AddrOrDomain::Domain(name) => name.contents.len() == name.len as usize,
+            AddrOrDomain::V4(_) | AddrOrDomain::V6(_) => true,
+        }
+    }
+
     /// Normalize IP literals, including IPv4-mapped IPv6, without resolving domains.
     pub(crate) fn canonicalize_ip(&mut self) {
         let ip = match &self.addr {
@@ -135,10 +148,7 @@ impl SocksAddr {
 
     pub fn from_domain(name: String, port: u16) -> Self {
         SocksAddr {
-            addr: AddrOrDomain::Domain(VarVec {
-                len: name.len() as u8,
-                contents: name.into_bytes(),
-            }),
+            addr: AddrOrDomain::Domain(VarVec::from(name.into_bytes())),
             port,
         }
     }
@@ -186,11 +196,11 @@ impl fmt::Display for AddrOrDomain {
         match &self {
             AddrOrDomain::V4(x) => write!(f, "{}", IpAddr::from(*x))?,
             AddrOrDomain::V6(x) => write!(f, "{}", IpAddr::from(*x))?,
-            AddrOrDomain::Domain(var_vec) => write!(
-                f,
-                "{}",
-                String::from_utf8(var_vec.contents.clone()).map_err(|_| fmt::Error)?
-            )?,
+            // The bytes come from the network. Formatting must not fail: a
+            // `fmt::Error` panics in `to_string()` and in log formatting.
+            AddrOrDomain::Domain(var_vec) => {
+                write!(f, "{}", String::from_utf8_lossy(&var_vec.contents))?
+            }
         }
         Ok(())
     }
@@ -216,7 +226,12 @@ impl ToSocketAddrs for SocksAddr {
     fn to_socket_addrs(&self) -> std::io::Result<vec::IntoIter<SocketAddr>> {
         match &self.addr {
             AddrOrDomain::Domain(x) => (
-                std::str::from_utf8(&x.contents).expect("Domain Name is not UTF8"),
+                std::str::from_utf8(&x.contents).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "domain name is not valid UTF-8",
+                    )
+                })?,
                 self.port,
             )
                 .to_socket_addrs(),

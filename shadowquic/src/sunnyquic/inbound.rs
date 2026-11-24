@@ -38,6 +38,8 @@ struct SunnyQuicUserManager {
     users: Arc<ArcSwap<HashMap<SunnyCredential, String>>>,
     config: RwLock<SunnyQuicServerCfg>,
     observer: Arc<Observer>,
+    /// Held while the user store is written.
+    persisting: tokio::sync::Mutex<()>,
 }
 
 impl SunnyQuicUserManager {
@@ -47,8 +49,11 @@ impl SunnyQuicUserManager {
         let Some(path) = config.user_store.clone() else {
             return;
         };
-        let users = config.users.clone();
         drop(config);
+        // One at a time, and the users are read after the wait: the store
+        // written last is then the newest one.
+        let _saving = self.persisting.lock().await;
+        let users = self.config.read().await.users.clone();
         let store = user_store::build_store(&users, &self.observer).await;
         if let Err(error) = user_store::save_store(&path, &store) {
             error!(
@@ -188,9 +193,7 @@ impl SunnyQuicServer {
         if let Some(store) = &store {
             user_store::merge_users(&mut cfg.users, store);
         }
-        let endpoint: EndServer = QuicServer::new(&cfg)
-            .await
-            .expect("Failed to listening on udp");
+        let endpoint: EndServer = QuicServer::new(&cfg).await?;
         let users = Arc::new(ArcSwap::new(Self::gen_users_hash(&cfg)));
         let observer = Arc::new(Observer::new());
         if let Some(store) = &store {
@@ -203,6 +206,7 @@ impl SunnyQuicServer {
             users: users.clone(),
             config: RwLock::new(cfg),
             observer: observer.clone(),
+            persisting: Default::default(),
         });
 
         Ok(Self {
@@ -309,6 +313,56 @@ impl Inbound for SunnyQuicServer {
         let users = self.users.clone();
         let user_manager = self.user_manager.clone();
         let tag = self.user_manager.config.read().await.tag.clone();
+        // Each handshake runs in its own task: a handshake that fails or
+        // stalls must not delay the connections queued behind it.
+        #[cfg(feature = "sunnyquic-noq")]
+        let fut = async move {
+            while let Some(incoming) = endpoint.next_incoming().await {
+                let endpoint = endpoint.clone();
+                let request_sender = request_sender.clone();
+                let users = users.clone();
+                let user_manager = user_manager.clone();
+                let span = tracing::info_span!("inbound",
+                    tag = %tag,
+                    src = tracing::field::Empty,
+                    user = tracing::field::Empty,
+                    id = tracing::field::Empty,
+                );
+                tokio::spawn(
+                    async move {
+                        let conn = match endpoint.handshake(incoming).await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                // Anyone can make handshakes fail, so this line
+                                // is rate limited.
+                                static LIMIT: crate::utils::log::LogRateLimit =
+                                    crate::utils::log::LogRateLimit::new();
+                                if let Some(held_back) = LIMIT.allow() {
+                                    error!(
+                                        event = "sunnyquic:connection_accept_failed",
+                                        held_back, "Error accepting quic connection: {}", e
+                                    );
+                                }
+                                return;
+                            }
+                        };
+                        // The users as they are once the handshake is done:
+                        // it can take long, and a user may be removed meanwhile.
+                        let user_hash = users.load_full();
+                        let _ =
+                            Self::handle_incoming(conn, request_sender, user_hash, user_manager)
+                                .await
+                                .map_err(|x| error!(event = "proxy:connection_failed", "{}", x));
+                    }
+                    .instrument(span),
+                );
+            }
+            error!(
+                event = "sunnyquic:quic_endpoint_closed",
+                "quic endpoint closed, no more connections are accepted"
+            );
+        };
+        #[cfg(not(feature = "sunnyquic-noq"))]
         let fut = async move {
             loop {
                 match QuicServer::accept(&endpoint).await {

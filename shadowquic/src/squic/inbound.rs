@@ -192,10 +192,9 @@ impl<C: QuicConnection> SQServerConn<C> {
                         event = "squic:authentication_succeeded",
                         "sunnyquic authentication succeeded"
                     );
-                    self.inner
-                        .authed
-                        .set(Ok(name.clone()))
-                        .expect("repeated authentication!");
+                    // A client may send its credentials again: the first
+                    // identity of the connection stays.
+                    let _ = self.inner.authed.set(Ok(name.clone()));
                 } else {
                     tracing::error!(
                         event = "squic:authentication_failed",

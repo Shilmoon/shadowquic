@@ -1,10 +1,5 @@
-use std::{
-    collections::HashMap,
-    net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use bytes::BytesMut;
 use tokio::{
     io::AsyncReadExt,
     net::{TcpSocket, TcpStream},
@@ -14,7 +9,7 @@ use tracing::{instrument, trace};
 
 use crate::{
     Outbound, UdpSession,
-    config::{DirectOutCfg, DnsStrategy, Interface},
+    config::{DirectOutCfg, DnsStrategy},
     dns::{DnsService, ResolverManager, resolve_destination},
     error::SError,
     msgs::socks5::{AddrOrDomain, SocksAddr},
@@ -188,18 +183,17 @@ impl DirectOut {
         Ok(socket.connect(dst).await?)
     }
 
-    async fn bind_udp(&self, bind_addr: SocketAddr, dst: SocksAddr) -> Result<DualSocket, SError> {
-        let interface = match self.cfg.socket_opt.bind_interface.clone() {
-            Some(iface) => Some(iface),
-            None if !bind_addr.ip().is_unspecified() => Some(Interface::Address(bind_addr)),
-            _ => None,
-        };
+    /// The socket of an association. Its local address comes from this
+    /// outbound's configuration alone: the address an association request
+    /// carries is the client's own (RFC 1928, section 6), named by the client,
+    /// possibly a remote one, and is neither bound nor looked up here.
+    async fn bind_udp(&self, dst: SocksAddr) -> Result<DualSocket, SError> {
         let socket = UdpSocketFactory {
             addr: dst.to_string(),
-            interface,
+            interface: self.cfg.socket_opt.bind_interface.clone(),
             fw_mark: self.cfg.socket_opt.fw_mark,
             protect_path: None,
-            try_dual_stack: bind_addr.ip().is_unspecified(),
+            try_dual_stack: true,
             resolver: self.dns.clone(),
         }
         .create_socket()
@@ -209,15 +203,7 @@ impl DirectOut {
 
     async fn handle_udp(&self, udp_session: UdpSession) -> Result<(), SError> {
         trace!(event = "direct:udp_association_started", bind_addr = %udp_session.bind_addr,"associating udp");
-        let bind_addr =
-            udp_session
-                .bind_addr
-                .to_socket_addrs()?
-                .next()
-                .ok_or(SError::DomainResolveFailed(
-                    udp_session.bind_addr.to_string(),
-                ))?;
-        let socket = self.bind_udp(bind_addr, udp_session.dst).await?;
+        let socket = self.bind_udp(udp_session.dst).await?;
         let upstream = Arc::new(socket);
         let upstream_clone = upstream.clone();
         let mut downstream = udp_session.recv;
@@ -233,16 +219,14 @@ impl DirectOut {
         let mut download: u64 = 0;
         let fut1 = async {
             loop {
-                let mut buf_send = BytesMut::new();
-                buf_send.resize(2000, 0);
                 //trace!("recv upstream");
-                let (len, dst) = upstream.recv_from(&mut buf_send).await?;
+                let (buf, dst) = upstream.recv_datagram().await?;
+                let len = buf.len();
                 //trace!("udp request reply from:{}", dst);
                 let dst = dns_cache_clone.inv_resolve(&dst).await;
                 //trace!("udp source inverse resolved to:{}", dst);
-                let buf = buf_send.freeze();
                 //trace!("udp recved:{} bytes", len);
-                let _ = udp_session.send.send_to(buf.slice(..len), dst).await?;
+                let _ = udp_session.send.send_to(buf, dst).await?;
                 download += len as u64;
             }
             #[allow(unreachable_code)]
@@ -480,10 +464,7 @@ mod test {
 
             let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let socket = direct
-                .bind_udp(
-                    "0.0.0.0:0".parse().unwrap(),
-                    SocksAddr::from(receiver.local_addr().unwrap()),
-                )
+                .bind_udp(SocksAddr::from(receiver.local_addr().unwrap()))
                 .await
                 .unwrap();
             assert_eq!(socket.local_addr().unwrap().ip(), source);
@@ -511,10 +492,7 @@ mod test {
         timeout(Duration::from_secs(5), async {
             let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let socket = DirectOut::default()
-                .bind_udp(
-                    "0.0.0.0:0".parse().unwrap(),
-                    SocksAddr::from(receiver.local_addr().unwrap()),
-                )
+                .bind_udp(SocksAddr::from(receiver.local_addr().unwrap()))
                 .await
                 .unwrap();
             socket

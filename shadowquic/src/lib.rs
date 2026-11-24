@@ -48,9 +48,14 @@ static ALLOCATOR: hotpath::CountingAllocator<tikv_jemallocator::Jemalloc> =
 #[global_allocator]
 static ALLOCATOR: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
-// jemalloc reads this before main, so profiling includes startup allocations.
+// jemalloc reads this before main. By default it keeps freed pages for ten
+// seconds in four arenas per CPU, which a relay that frees its buffers on many
+// threads pays for with a resident size several times its live heap. One arena
+// (threads still allocate from their own caches) and pages returned after one
+// second keep the resident size near the live heap, at the same throughput and
+// CPU cost. `_RJEM_MALLOC_CONF` in the environment overrides these settings.
 #[cfg(all(
-    feature = "mem-profile",
+    feature = "jemalloc",
     any(
         target_os = "android",
         all(
@@ -60,9 +65,16 @@ static ALLOCATOR: hotpath::CountingAllocator = hotpath::CountingAllocator::new()
     )
 ))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: Option<&'static std::ffi::c_char> =
+static MALLOC_CONF: Option<&'static std::ffi::c_char> = {
+    // With `mem-profile`, profiling starts here to include startup allocations.
+    let conf = if cfg!(feature = "mem-profile") {
+        c"narenas:1,dirty_decay_ms:1000,muzzy_decay_ms:0,prof:true,prof_active:true"
+    } else {
+        c"narenas:1,dirty_decay_ms:1000,muzzy_decay_ms:0"
+    };
     // SAFETY: The NUL-terminated configuration has static storage duration.
-    Some(unsafe { &*c"prof:true,prof_active:true".as_ptr() });
+    Some(unsafe { &*conf.as_ptr() })
+};
 
 #[cfg(feature = "restful-api")]
 pub mod api;
@@ -107,6 +119,18 @@ use crate::{
     observe::Observer,
     utils::{dual_socket::to_ipv4_mapped, log::fetch_add_req_cnt},
 };
+#[cfg(all(
+    test,
+    feature = "jemalloc",
+    any(
+        target_os = "android",
+        all(
+            any(target_os = "linux", target_os = "macos"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod alloc_conf_test;
 #[cfg(test)]
 mod manager_tests;
 pub enum ProxyRequest<T = AnyTcp, I = AnyUdpRecv, O = AnyUdpSend> {
@@ -209,7 +233,19 @@ pub struct UdpSession<I = AnyUdpRecv, O = AnyUdpSend> {
 impl UdpSession {
     /// Wait for the first datagram and retain it for the outbound receiver.
     pub(crate) async fn wait_first_packet(mut self) -> Result<Self, SError> {
-        let first: (Bytes, SocksAddr) = self.recv.recv_from().await?;
+        let first: (Bytes, SocksAddr) = match self.stream.as_mut() {
+            // The association ends with its control stream, also when that
+            // happens before the first datagram.
+            Some(control) => tokio::select! {
+                first = self.recv.recv_from() => first?,
+                _ = control_stream_event(control) => {
+                    return Err(SError::UDPSessionClosed(
+                        "udp session closed by control stream".into(),
+                    ));
+                }
+            },
+            None => self.recv.recv_from().await?,
+        };
         Ok(Self {
             dst: first.1.clone(),
             src_addr: self.src_addr,
@@ -223,6 +259,15 @@ impl UdpSession {
             user_context: self.user_context,
         })
     }
+}
+
+/// Resolves when the control stream of a UDP association closes, fails or
+/// carries data. Each of them ends the association, as it does once the
+/// association is running.
+async fn control_stream_event(control: &mut AnyTcp) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 1];
+    let _ = control.read(&mut buf).await;
 }
 
 struct FirstPacketUdpRecv {

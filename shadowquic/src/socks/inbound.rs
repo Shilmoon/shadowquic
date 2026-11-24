@@ -6,8 +6,10 @@ use crate::config::{AuthUser, SocksServerCfg};
 use crate::error::{SError, SResult};
 use crate::msgs::socks5::{
     self, AddrOrDomain, AuthReq, CmdReq, PasswordAuthReply, PasswordAuthReq,
-    SOCKS5_AUTH_METHOD_NONE, SOCKS5_AUTH_METHOD_PASSWORD, SOCKS5_CMD_TCP_BIND,
-    SOCKS5_CMD_TCP_CONNECT, SOCKS5_CMD_UDP_ASSOCIATE, SOCKS5_REPLY_SUCCEEDED, SOCKS5_VERSION,
+    SOCKS5_AUTH_METHOD_NONE, SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE, SOCKS5_AUTH_METHOD_PASSWORD,
+    SOCKS5_CMD_TCP_BIND, SOCKS5_CMD_TCP_CONNECT, SOCKS5_CMD_UDP_ASSOCIATE,
+    SOCKS5_REPLY_COMMAND_NOT_SUPPORTED, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_REPLY_SUCCEEDED,
+    SOCKS5_VERSION,
 };
 use crate::msgs::{SDecode, SEncode};
 use crate::observe::Observer;
@@ -121,6 +123,12 @@ where
         SOCKS5_AUTH_METHOD_PASSWORD
     };
     if !methods.contents.contains(&method) {
+        // Tell the client before closing (RFC 1928, section 3).
+        let refusal = socks5::AuthReply {
+            version: SOCKS5_VERSION,
+            method: SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE,
+        };
+        let _ = refusal.encode(&mut stream).await;
         return Err(SError::SocksError(format!(
             "authentication method not supported:{:?}",
             methods.contents
@@ -143,6 +151,12 @@ where
             .map_err(|_| SError::SocksError("invalid UTF-8 in password".to_string()))?,
     };
     if !users.contains(&user) {
+        // Any status other than zero is a failure (RFC 1929, section 2).
+        let refusal = PasswordAuthReply {
+            version: 0x01,
+            status: SOCKS5_REPLY_GENERAL_FAILURE,
+        };
+        let _ = refusal.encode(&mut stream).await;
         return Err(SError::SocksError("authentication failed".to_string()));
     }
     tracing::Span::current().record("user", tracing::field::display(&user.username));
@@ -193,11 +207,16 @@ where
             reply.bind_addr = local_addr.into();
             (reply, Some(socket))
         }
-        SOCKS5_CMD_TCP_BIND => {
-            return Err(SError::ProtocolUnimpl);
-        }
-        _ => {
-            return Err(SError::ProtocolViolation);
+        cmd => {
+            // Tell the client before closing (RFC 1928, section 6).
+            reply.rep = SOCKS5_REPLY_COMMAND_NOT_SUPPORTED;
+            reply.bind_addr.addr = AddrOrDomain::V4([0u8; 4]);
+            let _ = reply.encode(&mut s).await;
+            return Err(if cmd == SOCKS5_CMD_TCP_BIND {
+                SError::ProtocolUnimpl
+            } else {
+                SError::ProtocolViolation
+            });
         }
     };
 

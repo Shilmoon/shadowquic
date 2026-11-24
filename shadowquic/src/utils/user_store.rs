@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +31,7 @@ pub struct UserStore {
 
 /// Load the store from disk. Returns `Ok(None)` if the file does not exist.
 pub fn load_store(path: &Path) -> Result<Option<UserStore>, SError> {
+    remove_stale_tmp(path);
     if !path.exists() {
         return Ok(None);
     }
@@ -40,6 +45,43 @@ pub fn load_store(path: &Path) -> Result<Option<UserStore>, SError> {
     Ok(Some(store))
 }
 
+/// Removes the temporary files that saves of an earlier run left behind when
+/// they were cut short: they hold the users' passwords. The files of this
+/// process stay, as a save may be under way.
+fn remove_stale_tmp(path: &Path) {
+    let (Some(file), Some(dir)) = (
+        path.file_name().and_then(|name| name.to_str()),
+        path.parent(),
+    ) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // "<file>.<pid>.<save>.tmp", as `save_store` names them.
+        let pid = name
+            .to_str()
+            .and_then(|name| {
+                name.strip_prefix(file)?
+                    .strip_prefix('.')?
+                    .strip_suffix(".tmp")
+            })
+            .and_then(|middle| middle.split_once('.'))
+            .filter(|(_, save)| save.parse::<u64>().is_ok())
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        if pid.is_some_and(|pid| pid != std::process::id()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Atomically write the store to disk (tmp file + rename).
 pub fn save_store(path: &Path, store: &UserStore) -> Result<(), SError> {
     let content = serde_saphyr::to_string(store).map_err(|e| {
@@ -47,10 +89,21 @@ pub fn save_store(path: &Path, store: &UserStore) -> Result<(), SError> {
             "failed to serialize user store: {e}"
         )))
     })?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // A name of its own for every save: saves that overlap must not write
+    // into, or rename away, each other's file.
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(name);
+    let saved = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(saved?)
 }
 
 /// Merge users loaded from the store into the config users.

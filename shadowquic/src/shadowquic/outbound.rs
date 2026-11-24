@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell, SetOnce};
+use tokio::sync::{Mutex, SetOnce};
 use tracing::{Instrument, instrument};
 
 use super::quinn_wrapper::EndClient;
@@ -12,7 +12,7 @@ use crate::{
     dns::ResolverManager,
     error::SError,
     msgs::squic::{SQExtError, UserStats},
-    quic::QuicClient,
+    quic::{ClientEndpoint, QuicClient},
     squic::{inbound::UserManager, outbound},
     utils::socket_opt::{SocketFactory, UdpSocketFactory},
 };
@@ -24,7 +24,7 @@ pub type ShadowQuicConn = SQConn<<EndClient as QuicClient>::C>;
 pub struct ShadowQuicClient {
     pub quic_conn: Mutex<Option<ShadowQuicConn>>,
     pub config: ShadowQuicClientCfg,
-    pub quic_end: OnceCell<EndClient>,
+    pub quic_end: ClientEndpoint<EndClient>,
     pub addr_resolver: Arc<dyn crate::dns::DnsService>,
     pub socket_factory: Arc<dyn SocketFactory>,
 }
@@ -42,7 +42,7 @@ impl ShadowQuicClient {
             .unwrap_or_else(|| panic!("dns resolver not found: {}", tag));
         Self {
             quic_conn: Mutex::new(None),
-            quic_end: OnceCell::new(),
+            quic_end: ClientEndpoint::new(),
             socket_factory: Arc::new(UdpSocketFactory {
                 addr: cfg.addr.clone(),
                 interface: cfg.socket_opt.bind_interface.clone(),
@@ -60,14 +60,11 @@ impl ShadowQuicClient {
     }
 
     pub async fn get_conn(&self) -> Result<ShadowQuicConn, SError> {
-        let addr =
-            crate::dns::resolve_destination(&*self.addr_resolver, &self.config.addr.parse()?, None)
-                .await?;
+        let addrs =
+            crate::dns::resolve_all(&*self.addr_resolver, &self.config.addr.parse()?).await?;
         let conn = self
             .quic_end
-            .get_or_try_init(|| self.init_endpoint())
-            .await?
-            .connect(addr, &self.config.server_name)
+            .connect(&addrs, &self.config.server_name, || self.init_endpoint())
             .await?;
 
         let conn = SQConn::new(

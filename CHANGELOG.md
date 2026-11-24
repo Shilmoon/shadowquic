@@ -5,6 +5,53 @@ Git tags and commits; dates are the dates of the tagged commits. Routine version
 bumps, formatting, and dependency updates are omitted unless they affect behavior.
 Version links compare each release with the preceding tag.
 
+## Unreleased
+
+### Changed
+
+- Builds with jemalloc carry the allocator settings `narenas:1,dirty_decay_ms:1000,muzzy_decay_ms:0`:
+  freed memory goes back to the system after 1 s instead of 10 s, from one arena. On a
+  multi-gigabit transfer the server's peak memory drops from about 140 MB to about 50 MB at
+  equal throughput and CPU use. The `_RJEM_MALLOC_CONF` environment variable overrides them.
+- UDP over stream keeps at most 256 streams open per connection and closes the least recently
+  used ones; a destination whose stream was closed gets a new one with its next datagram.
+- The direct outbound no longer binds or resolves the address named in a UDP association
+  request: that address is the client's own (RFC 1928, section 6).
+- The SOCKS inbound answers an unsupported authentication method, an unsupported command and a
+  failed password check before closing the connection.
+- Failed QUIC handshakes are logged at most once per 100 ms for each protocol, with the number of
+  lines held back.
+
+### Fixed
+
+- A handshake that stalls or fails no longer delays the connections queued behind it, for
+  ShadowQUIC and SunnyQUIC inbounds (#206).
+- A ClientHello spanning several packets no longer fails the first 0-RTT connection (#191).
+- A client keeps connecting when its server name resolves to another address family than the
+  one its socket was created for, or to an IPv4-mapped address (#125).
+- A request sent as 0-RTT data that the server rejects, as after a server restart, is sent again
+  instead of being lost: TCP, UDP, API calls and the SunnyQUIC authentication.
+- Resumption tickets are kept for 32768 sessions instead of 256, so that busy servers keep
+  accepting 0-RTT.
+- A destination name that is not UTF-8 no longer stops the SOCKS inbound or the server process.
+- Lengths chosen by the peer are no longer allocated before their data arrives, and a name
+  whose length byte disagrees with its contents is refused instead of truncated.
+- Datagrams for a context id that is never announced are bounded in number and age instead of
+  being kept forever; a malformed datagram or stream no longer stops UDP reception for the
+  whole connection; running out of context ids ends the association instead of hanging.
+- UDP over stream no longer stalls once an association has used every stream the peer allows.
+- One datagram that cannot be sent (name over 255 bytes, or a reply too large for the socket)
+  no longer ends its association.
+- A UDP association closed before its first datagram is released; malformed SOCKS datagrams
+  are dropped; large UDP payloads are no longer truncated.
+- The SOCKS outbound treats a refused UDP association as an error, resolves through the
+  configured resolver, and no longer panics on an unexpected reply or a missing password.
+- A second SunnyQUIC authentication on one connection no longer panics, and a user removed
+  during their handshake is no longer authenticated.
+- An inbound that cannot bind its address returns the error instead of panicking.
+- Overlapping saves of the user store no longer fail, and temporary files left by an
+  interrupted save are removed at the next start.
+
 ## [0.4.11](https://github.com/spongebob888/shadowquic/compare/v0.4.10...v0.4.11) - 2026-11-15
 
 ### Added

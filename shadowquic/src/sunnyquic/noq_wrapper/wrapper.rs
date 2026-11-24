@@ -36,9 +36,12 @@ use crate::{
         maybe_warn_cipher_suite_on_weak_arch, normalize_cipher_suite_preference,
     },
     error::{SError, SResult},
-    quic::{MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection, QuicErrorRepr, QuicServer},
+    quic::{
+        EarlyDataOutcome, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection, QuicErrorRepr,
+        QuicServer, Reach,
+    },
     sunnyquic::dynamic_cert::DynamicCertResolver,
-    utils::socket_opt::SocketFactory,
+    utils::{poll_now, socket_opt::SocketFactory},
 };
 
 pub type Connection = noq::Connection;
@@ -47,6 +50,7 @@ pub type Connection = noq::Connection;
 pub struct EndClient {
     inner: noq::Endpoint,
     cfg: Arc<SunnyQuicClientCfg>,
+    reach: Reach,
 }
 
 #[derive(Clone)]
@@ -146,6 +150,29 @@ impl QuicConnection for Connection {
     fn close(&self, error_code: u64, reason: &[u8]) {
         self.close(VarInt::from_u64(error_code).unwrap(), reason);
     }
+    fn early_data_outcome(&self, stream: &Self::SendStream) -> Option<EarlyDataOutcome> {
+        // Only a stream opened in 0-RTT reports the rejection, and only once
+        // the handshake has finished.
+        let rejected = |stopped| {
+            matches!(
+                poll_now(stopped),
+                Some(Err(noq::StoppedError::ZeroRttRejected))
+            )
+        };
+        let stopped = stream.stopped();
+        match poll_now(self.authenticated()) {
+            Some(Ok(())) if rejected(stopped) => Some(Box::pin(std::future::ready(Ok(true)))),
+            Some(_) => None,
+            None => {
+                let conn = self.clone();
+                let stopped = stream.stopped();
+                Some(Box::pin(async move {
+                    conn.authenticated().await?;
+                    Ok(rejected(stopped))
+                }))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -177,7 +204,7 @@ impl QuicClient for EndClient {
         .await
     }
     async fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<Self::C, QuicErrorRepr> {
-        let conn = self.inner.connect(addr, server_name)?;
+        let conn = self.inner.connect(self.reach.form_of(addr), server_name)?;
         let mut accepted_0rtt = None;
         let conn = if self.cfg.zero_rtt {
             match conn.into_0rtt() {
@@ -232,6 +259,7 @@ impl QuicClient for EndClient {
         socket_factory: Arc<dyn SocketFactory>,
     ) -> SResult<Self> {
         let socket = socket_factory.create_socket().await.map_err(SError::Io)?;
+        let reach = Reach::of(&socket);
         let runtime =
             noq::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         let end = noq::Endpoint::new(
@@ -244,7 +272,12 @@ impl QuicClient for EndClient {
         Ok(EndClient {
             inner: end,
             cfg: Arc::new(cfg.to_owned()),
+            reach,
         })
+    }
+
+    fn can_reach(&self, addr: &SocketAddr) -> bool {
+        self.reach.reaches(addr)
     }
 
     type C = Connection;
@@ -463,38 +496,50 @@ impl QuicServer for EndServer {
     }
 
     async fn accept(&self) -> Result<Self::C, QuicErrorRepr> {
-        match self.deref().accept().await {
-            Some(conn) => {
-                let conn = conn.accept()?;
-                let cfg = self.cfg.load_full();
-                let connection = if cfg.zero_rtt {
-                    match conn.into_0rtt() {
-                        Ok((conn, accepted)) => {
-                            let _conn_clone = conn.clone();
-                            tokio::spawn(
-                                async move {
-                                    let accepted = accepted.await;
-                                    debug!(
-                                        event = "quic:zero_rtt_result",
-                                        accepted = %accepted,
-                                        "zero rtt accept result",
-                                    );
-                                }
-                                .in_current_span(),
-                            );
-                            conn
-                        }
-                        Err(conn) => conn.await?,
-                    }
-                } else {
-                    conn.await?
-                };
-                Ok(connection)
-            }
+        match self.next_incoming().await {
+            Some(incoming) => self.handshake(incoming).await,
             None => {
                 panic!("Quic endpoint closed");
             }
         }
+    }
+}
+
+impl EndServer {
+    /// Waits for the next connection attempt without driving its handshake, so
+    /// the caller can run [`EndServer::handshake`] off its accept loop. Returns
+    /// `None` once the endpoint is closed.
+    pub async fn next_incoming(&self) -> Option<noq::Incoming> {
+        self.deref().accept().await
+    }
+
+    /// Drives one connection attempt through its handshake.
+    pub async fn handshake(&self, incoming: noq::Incoming) -> Result<Connection, QuicErrorRepr> {
+        let conn = incoming.accept()?;
+        let cfg = self.cfg.load_full();
+        let connection = if cfg.zero_rtt {
+            match conn.into_0rtt() {
+                Ok((conn, accepted)) => {
+                    let _conn_clone = conn.clone();
+                    tokio::spawn(
+                        async move {
+                            let accepted = accepted.await;
+                            debug!(
+                                event = "quic:zero_rtt_result",
+                                accepted = %accepted,
+                                "zero rtt accept result",
+                            );
+                        }
+                        .in_current_span(),
+                    );
+                    conn
+                }
+                Err(conn) => conn.await?,
+            }
+        } else {
+            conn.await?
+        };
+        Ok(connection)
     }
 }
 

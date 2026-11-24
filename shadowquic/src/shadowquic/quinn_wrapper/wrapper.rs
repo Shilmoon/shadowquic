@@ -42,9 +42,13 @@ use crate::{
     error::SResult,
     msgs::squic::ConnStats,
     quic::{
-        AuthedConn, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection, QuicErrorRepr, QuicServer,
+        AuthedConn, EarlyDataOutcome, MAX_DATAGRAM_WINDOW, QuicClient, QuicConnection,
+        QuicErrorRepr, QuicServer, Reach,
     },
-    utils::socket_opt::{SocketFactory, UdpSocketFactory},
+    utils::{
+        poll_now,
+        socket_opt::{SocketFactory, UdpSocketFactory},
+    },
 };
 
 pub type Connection = quinn::Connection;
@@ -60,6 +64,7 @@ pub struct EndServer {
 pub struct EndClient {
     inner: quinn::Endpoint,
     zero_rtt: bool,
+    reach: Reach,
 }
 
 impl Deref for EndServer {
@@ -141,6 +146,29 @@ impl QuicConnection for Connection {
     fn close(&self, error_code: u64, reason: &[u8]) {
         self.close(VarInt::from_u64(error_code).unwrap(), reason);
     }
+    fn early_data_outcome(&self, stream: &Self::SendStream) -> Option<EarlyDataOutcome> {
+        // Only a stream opened in 0-RTT reports the rejection, and only once
+        // the handshake has finished.
+        let rejected = |stopped| {
+            matches!(
+                poll_now(stopped),
+                Some(Err(quinn::StoppedError::ZeroRttRejected))
+            )
+        };
+        let stopped = stream.stopped();
+        match poll_now(self.authenticated()) {
+            Some(Ok(())) if rejected(stopped) => Some(Box::pin(std::future::ready(Ok(true)))),
+            Some(_) => None,
+            None => {
+                let conn = self.clone();
+                let stopped = stream.stopped();
+                Some(Box::pin(async move {
+                    conn.authenticated().await?;
+                    Ok(rejected(stopped))
+                }))
+            }
+        }
+    }
     fn get_conn_stats(&self) -> Option<ConnStats> {
         let stats = self.stats();
         Some(ConnStats {
@@ -187,7 +215,7 @@ impl QuicClient for EndClient {
         .await
     }
     async fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<Self::C, QuicErrorRepr> {
-        let conn = self.inner.connect(addr, server_name)?;
+        let conn = self.inner.connect(self.reach.form_of(addr), server_name)?;
         let conn = if self.zero_rtt {
             match conn.into_0rtt() {
                 Ok(x) => {
@@ -246,17 +274,24 @@ impl QuicClient for EndClient {
     ) -> SResult<Self> {
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        let socket = socket_factory.create_socket().await?;
+        let reach = Reach::of(&socket);
         let end = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             None,
-            std::net::UdpSocket::from(socket_factory.create_socket().await?),
+            std::net::UdpSocket::from(socket),
             runtime,
         )?;
         end.set_default_client_config(gen_client_cfg(cfg));
         Ok(EndClient {
             inner: end,
             zero_rtt: cfg.zero_rtt,
+            reach,
         })
+    }
+
+    fn can_reach(&self, addr: &SocketAddr) -> bool {
+        self.reach.reaches(addr)
     }
 
     type C = Connection;
@@ -389,6 +424,9 @@ pub fn gen_client_cfg(cfg: &ShadowQuicClientCfg) -> quinn::ClientConfig {
     config
 }
 
+/// Session tickets the server remembers for 0-RTT resumption (two per connection).
+const SESSION_CACHE_ENTRIES: usize = 32 * 1024;
+
 fn bind_server_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
     if bind_addr.is_ipv6() && bind_addr.ip().is_unspecified() {
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
@@ -419,6 +457,12 @@ impl QuicServer for EndServer {
                 .with_no_client_auth()
                 .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(priv_key))
                 .expect("invalid cert or key when create shadowquic server");
+        // Every connection is issued two session tickets. With the default
+        // 256-entry cache a client's ticket is evicted once ~128 other
+        // connections were made, and its next 0-RTT attempt is rejected,
+        // which fails the request sent in it.
+        crypto.session_storage =
+            quinn::rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_ENTRIES);
 
         let config = gen_server_config(cfg, &mut crypto);
         let socket = bind_server_udp_socket(cfg.bind_addr)?;
@@ -444,48 +488,64 @@ impl QuicServer for EndServer {
         Ok(())
     }
     async fn accept(&self) -> Result<Self::C, QuicErrorRepr> {
-        match self.deref().accept().await {
-            Some(conn) => {
-                let conn = conn.accept()?;
-                let connection = if self.zero_rtt.load(Relaxed) {
-                    match conn.into_0rtt() {
-                        Ok(conn) => {
-                            let conn_clone = conn.clone();
-                            tokio::spawn(
-                                async move {
-                                    if let Err(error) = conn_clone.authenticated().await {
-                                        debug!(event = "quic:zero_rtt_handshake_failed", %error, "0-RTT handshake failed");
-                                        return;
-                                    }
-                                    debug!(event = "quic:zero_rtt_handshake_completed", "0-RTT handshake completed");
-                                    if conn_clone.is_jls() == Some(false) {
-                                        error!(event = "jls:jls_authentication_failed", "JLS hijacked or wrong pwd/iv");
-                                        conn_clone.close(0u8.into(), b"");
-                                    }
-                                }
-                                .in_current_span(),
-                            );
-                            conn
-                        }
-                        Err(conn) => conn.await?,
-                    }
-                } else {
-                    conn.await?
-                };
-                if connection.is_jls() == Some(false) {
-                    error!(
-                        event = "jls:jls_authentication_failed",
-                        "JLS hijacked or wrong pwd/iv"
-                    );
-                    connection.close(0u8.into(), b"");
-                    return Err(QuicErrorRepr::JlsAuthFailed);
-                }
-                Ok(connection)
-            }
+        match self.next_incoming().await {
+            Some(incoming) => self.handshake(incoming).await,
             None => {
                 panic!("Quic endpoint closed");
             }
         }
+    }
+}
+
+impl EndServer {
+    /// Waits for the next connection attempt without driving its handshake, so
+    /// the caller can run [`EndServer::handshake`] off its accept loop. Returns
+    /// `None` once the endpoint is closed.
+    pub async fn next_incoming(&self) -> Option<quinn::Incoming> {
+        self.deref().accept().await
+    }
+
+    /// Drives one connection attempt until its JLS result is known.
+    pub async fn handshake(&self, incoming: quinn::Incoming) -> Result<Connection, QuicErrorRepr> {
+        let mut conn = incoming.accept()?;
+        let connection = if self.zero_rtt.load(Relaxed) {
+            // A ClientHello may span several Initial packets. Until all of it has
+            // arrived the JLS result and the user are unknown, so wait for it
+            // before handing out the 0-RTT connection.
+            conn.handshake_data().await?;
+            match conn.into_0rtt() {
+                Ok(conn) => {
+                    let conn_clone = conn.clone();
+                    tokio::spawn(
+                        async move {
+                            if let Err(error) = conn_clone.authenticated().await {
+                                debug!(event = "quic:zero_rtt_handshake_failed", %error, "0-RTT handshake failed");
+                                return;
+                            }
+                            debug!(event = "quic:zero_rtt_handshake_completed", "0-RTT handshake completed");
+                            if conn_clone.is_jls() == Some(false) {
+                                error!(event = "jls:jls_authentication_failed", "JLS hijacked or wrong pwd/iv");
+                                conn_clone.close(0u8.into(), b"");
+                            }
+                        }
+                        .in_current_span(),
+                    );
+                    conn
+                }
+                Err(conn) => conn.await?,
+            }
+        } else {
+            conn.await?
+        };
+        if connection.is_jls() == Some(false) {
+            error!(
+                event = "jls:jls_authentication_failed",
+                "JLS hijacked or wrong pwd/iv"
+            );
+            connection.close(0u8.into(), b"");
+            return Err(QuicErrorRepr::JlsAuthFailed);
+        }
+        Ok(connection)
     }
 }
 

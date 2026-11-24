@@ -433,6 +433,12 @@ fn impl_struct_decode(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenSt
         quote! {
             use tokio::io::AsyncReadExt;
             let len = u32::decode(s).await? as usize;
+            // The peer chose `len`, and the buffer is allocated before its
+            // bytes arrive. No size-tagged struct comes near this limit.
+            const SIZE_LIMIT: usize = 1 << 20;
+            if len > SIZE_LIMIT {
+                return Err(SError::ProtocolViolation);
+            }
             let mut buf = vec![0u8; len];
             s.read_exact(&mut buf).await?;
             const COMPAT_PADDING_LIMIT: usize = 1024;

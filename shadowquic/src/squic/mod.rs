@@ -10,7 +10,10 @@ use std::{
     io::Cursor,
     mem::replace,
     ops::Deref,
-    sync::{Arc, atomic::AtomicU16},
+    sync::{
+        Arc,
+        atomic::{AtomicU16, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -22,7 +25,7 @@ use tokio::{
         watch::{Receiver, Sender, channel},
     },
 };
-use tracing::{Instrument, Level, debug, error, event, info, trace};
+use tracing::{Instrument, Level, debug, error, event, info, trace, warn};
 
 use crate::{
     AnyUdpRecv, AnyUdpSend, UdpSend, UdpSendExt,
@@ -35,11 +38,17 @@ use crate::{
     quic::QuicConnection,
 };
 
+pub(crate) mod early;
 pub mod inbound;
 pub mod outbound;
+#[cfg(all(test, feature = "shadowquic-quinn"))]
+mod udp_send_tests;
+mod uni_pool;
 
 #[cfg(test)]
 mod udp_recv_tests;
+#[cfg(test)]
+mod udp_robustness_tests;
 
 /// SQuic connection, it is shared by shadowquic and sunnyquic and is a wrapper of quic connection.
 /// It contains a connection object and two ID store for managing UDP sockets.
@@ -52,6 +61,8 @@ pub struct SQConnInner<T: QuicConnection> {
     pub authed: SetOnce<SResult<String>>,
     pub(crate) send_id_store: IDStore<()>,
     pub(crate) recv_id_store: IDStore<(AnyUdpSend, SocksAddr)>,
+    /// The streams udp over stream is sent on.
+    uni_pool: uni_pool::UniPool<T::SendStream>,
     /// Latest successful peer stats response and the time it was received.
     pub stats: Mutex<Option<SQConnStats>>,
     /// Serialize remote refreshes without blocking readers of the cached sample.
@@ -69,7 +80,9 @@ impl<T: QuicConnection> SQConn<T> {
             recv_id_store: IDStore {
                 id_counter: Default::default(),
                 inner: Default::default(),
+                pending_packets: Default::default(),
             },
+            uni_pool: Default::default(),
             stats: Default::default(),
             stats_refresh: Default::default(),
             birth_time: Instant::now(),
@@ -118,15 +131,32 @@ pub(crate) async fn auth_sunny<T: QuicConnection>(
     user_hash: SunnyCredential,
 ) -> SResult<()> {
     if conn.authed.get().is_none() {
+        let request = SQReq::SQAuthenticate(user_hash);
         let (mut send, _recv, _id) = conn.conn.open_bi().await?;
-        SQReq::SQAuthenticate(user_hash).encode(&mut send).await?;
+        let early = conn.conn.early_data_outcome(&send);
+        let sent = request.encode(&mut send).await;
+        // A server that rejects 0-RTT discards the request with the rest of
+        // the early data and would never learn who this is: send it again.
+        let rejected = match early {
+            Some(outcome) if sent.is_err() => outcome.await?,
+            Some(outcome) => {
+                // Set already when another task authenticated in the meantime.
+                let _ = conn.authed.set(Ok(username.to_string()));
+                outcome.await?
+            }
+            None => false,
+        };
+        if rejected {
+            let (mut send, _recv, _id) = conn.conn.open_bi().await?;
+            request.encode(&mut send).await?;
+        } else {
+            sent?;
+        }
         debug!(
             event = "security:authentication_request_sent",
             "authentication request sent"
         );
-        conn.authed
-            .set(Ok(username.to_string()))
-            .expect("repeated authentication");
+        let _ = conn.authed.set(Ok(username.to_string()));
     }
     Ok(())
 }
@@ -134,6 +164,38 @@ pub(crate) async fn auth_sunny<T: QuicConnection>(
 pub(crate) struct NotifyBuffer {
     pub(crate) notify: Sender<()>,
     pub(crate) buffer: Vec<Bytes>,
+    /// When this pending slot was created or last restarted.
+    pub(crate) created: tokio::time::Instant,
+}
+
+/// A datagram or unistream can overtake the control header that announces its
+/// context id, so input for an unknown id is kept for a short time. The peer
+/// decides how much of it arrives, so the backlog is bounded: at most
+/// `PENDING_MAX_PACKETS` datagrams per connection, none older than `PENDING_TTL`.
+const PENDING_MAX_PACKETS: usize = 2048;
+const PENDING_TTL: Duration = Duration::from_secs(5);
+
+impl NotifyBuffer {
+    fn new(notify: Sender<()>) -> Self {
+        Self {
+            notify,
+            buffer: Vec::new(),
+            created: tokio::time::Instant::now(),
+        }
+    }
+    fn expired(&self) -> bool {
+        self.created.elapsed() > PENDING_TTL
+    }
+    /// The backlog to deliver once the id is announced. An expired backlog
+    /// belongs to an earlier use of the id and is dropped.
+    fn into_fresh_buffer(self) -> (Sender<()>, Vec<Bytes>) {
+        let buffer = if self.expired() {
+            Vec::new()
+        } else {
+            self.buffer
+        };
+        (self.notify, buffer)
+    }
 }
 
 // Use watch channel here. Notify is not suitable here
@@ -146,6 +208,8 @@ type IDStoreVal<T> = Result<T, NotifyBuffer>;
 pub(crate) struct IDStore<T = (AnyUdpSend, SocksAddr)> {
     pub(crate) id_counter: Arc<AtomicU16>,
     pub(crate) inner: Arc<RwLock<HashMap<u16, IDStoreVal<T>>>>,
+    /// Datagrams held for unannounced ids, see `PENDING_MAX_PACKETS`.
+    pending_packets: Arc<AtomicUsize>,
 }
 
 impl<T> IDStore<T>
@@ -166,10 +230,7 @@ where
                     .cloned(),
                 Entry::Vacant(vacant_entry) => {
                     let (s, r) = channel(());
-                    vacant_entry.insert(Err(NotifyBuffer {
-                        notify: s,
-                        buffer: Vec::new(),
-                    }));
+                    vacant_entry.insert(Err(NotifyBuffer::new(s)));
                     Err(r)
                 }
             }
@@ -190,9 +251,17 @@ where
             Ok(r) => Ok(r),
             Err(mut n) => {
                 // This may fail is UDP session is closed right at this moment.
-                n.changed()
-                    .await
-                    .map_err(|_| SError::UDPSessionClosed("notify sender dropped".to_string()))?;
+                match tokio::time::timeout(PENDING_TTL, n.changed()).await {
+                    Ok(changed) => changed.map_err(|_| {
+                        SError::UDPSessionClosed("notify sender dropped".to_string())
+                    })?,
+                    Err(_) => {
+                        self.forget_pending(id).await;
+                        return Err(SError::UDPSessionClosed(
+                            "context id not announced in time".to_string(),
+                        ));
+                    }
+                }
                 //
                 let ret = self
                     .try_get_socket(id)
@@ -201,6 +270,20 @@ where
                 Ok(ret)
             }
         }
+    }
+    /// Drops the slot of an id nobody announced, unless datagrams wait in it.
+    async fn forget_pending(&self, id: u16) {
+        let mut h = self.inner.write().await;
+        if matches!(h.get(&id), Some(Err(n)) if n.buffer.is_empty()) {
+            h.remove(&id);
+        }
+    }
+    fn release_pending(&self, packets: usize) {
+        let _ = self
+            .pending_packets
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(packets))
+            });
     }
     #[allow(dead_code)]
     async fn store_socket(&self, id: u16, val: T) -> Option<Vec<Bytes>> {
@@ -227,7 +310,9 @@ where
                             panic!("should be notify"); // should never happen
                         }
                         Err(n) => {
-                            n.notify.send(()).unwrap_or_else(|_| {
+                            self.release_pending(n.buffer.len());
+                            let (notify, buffer) = n.into_fresh_buffer();
+                            notify.send(()).unwrap_or_else(|_| {
                                 debug!(
                                     event = "squic:context_subscriber_missing",
                                     "id:{} notifier without subscriber", id
@@ -239,7 +324,7 @@ where
                                 "notify socket id:{}",
                                 id
                             );
-                            return Some(n.buffer);
+                            return Some(buffer);
                         }
                     }
                 }
@@ -249,8 +334,14 @@ where
         }
         None
     }
-    async fn fetch_new_id(&self, val: T) -> u16 {
+    async fn fetch_new_id(&self, val: T) -> SResult<u16> {
         let mut inner = self.inner.write().await;
+        // Every id is taken: searching for a free one would never end.
+        if inner.len() > u16::MAX as usize {
+            return Err(SError::UDPSessionClosed(
+                "all udp context ids of this connection are in use".into(),
+            ));
+        }
         trace!(
             event = "squic:send_socket_count",
             "sending side socket number: {}",
@@ -266,48 +357,81 @@ where
                 break;
             }
         }
-        r
+        Ok(r)
     }
 }
 
 impl IDStore {
-    async fn feed_datagram(&self, id: u16, packet: Bytes) -> SResult<()> {
+    /// Delivers a datagram to its association. Returns `true` when the id is
+    /// not announced yet and the datagram waits in the bounded backlog.
+    async fn feed_datagram(&self, id: u16, packet: Bytes) -> SResult<bool> {
         let lock = self.inner.read().await;
         if let Some(Ok((socket, addr))) = lock.get(&id) {
             let (socket, addr) = (socket.clone(), addr.clone());
             drop(lock);
             // Nonblocking sender
             socket.try_send_to(packet, addr.clone()).await?;
-            Ok(())
+            Ok(false)
         } else {
             drop(lock);
             let mut lock = self.inner.write().await;
             // Need to recheck
             // During change from read lock to write lock, hashmap may be modified
+            if let Some(Ok((socket, addr))) = lock.get(&id) {
+                let (socket, addr) = (socket.clone(), addr.clone());
+                drop(lock);
+                // Use nonblocking style incase it blocks quic datagram dispatcher.
+                socket.try_send_to(packet, addr).await?;
+                return Ok(false);
+            }
+            if let Some(Err(pending)) = lock.get_mut(&id)
+                && pending.expired()
+            {
+                // Left over from an earlier use of this id.
+                self.release_pending(pending.buffer.len());
+                pending.buffer.clear();
+                pending.created = tokio::time::Instant::now();
+            }
+            if self.pending_packets.load(Ordering::Relaxed) >= PENDING_MAX_PACKETS {
+                debug!(
+                    event = "squic:datagram_dropped",
+                    context_id = id,
+                    "backlog for unannounced context ids is full, dropping datagram"
+                );
+                return Ok(lock.contains_key(&id));
+            }
+            self.pending_packets.fetch_add(1, Ordering::Relaxed);
             match lock.entry(id) {
-                Entry::Occupied(mut entry) => match entry.get_mut() {
-                    Ok((socket, addr)) => {
-                        let (socket, addr) = (socket.clone(), addr.clone());
-                        drop(lock);
-                        // Use nonblocking style incase it blocks quic datagram dispatcher.
-                        socket.try_send_to(packet, addr).await?;
-                        Ok(())
+                Entry::Occupied(mut entry) => {
+                    if let Err(pending) = entry.get_mut() {
+                        pending.buffer.push(packet);
                     }
-                    Err(notify) => {
-                        notify.buffer.push(packet);
-                        Ok(())
-                    }
-                },
-                Entry::Vacant(vacant_entry) => {
+                }
+                Entry::Vacant(entry) => {
                     let (s, _r) = channel(());
-                    vacant_entry.insert(Err(NotifyBuffer {
-                        notify: s,
-                        buffer: vec![packet],
-                    }));
-                    Ok(())
+                    let mut pending = NotifyBuffer::new(s);
+                    pending.buffer.push(packet);
+                    entry.insert(Err(pending));
                 }
             }
+            Ok(true)
         }
+    }
+    /// Frees the slots of unannounced ids that are older than `PENDING_TTL`.
+    /// Returns whether younger ones remain.
+    async fn purge_expired(&self) -> bool {
+        let mut h = self.inner.write().await;
+        h.retain(|_, slot| !matches!(slot, Err(n) if n.expired()));
+        let mut packets = 0;
+        let mut pending = false;
+        for slot in h.values() {
+            if let Err(n) = slot {
+                pending = true;
+                packets += n.buffer.len();
+            }
+        }
+        self.pending_packets.store(packets, Ordering::Relaxed);
+        pending
     }
     async fn store_socket_with_prelude(
         &self,
@@ -341,11 +465,13 @@ impl IDStore {
                             panic!("should be notify"); // should never happen
                         }
                         Err(n) => {
-                            for bytes in n.buffer {
+                            self.release_pending(n.buffer.len());
+                            let (notify, buffer) = n.into_fresh_buffer();
+                            for bytes in buffer {
                                 socket.send_to(bytes, addr.clone()).await?;
                             }
 
-                            n.notify.send(()).unwrap_or_else(|_| {
+                            notify.send(()).unwrap_or_else(|_| {
                                 debug!(
                                     event = "squic:context_subscriber_missing",
                                     "id:{} notifier without subscriber", id
@@ -372,26 +498,30 @@ impl IDStore {
 /// It is created for each association task
 /// The local dst_map works as a inverse map from destination to id
 /// When session ended, the ids created by this session will be removed from the IDStore.
-struct AssociateSendSession<W: AsyncWrite> {
+struct AssociateSendSession<C: QuicConnection> {
     id_store: IDStore<()>,
     dst_map: HashMap<SocksAddr, u16>,
-    unistream_map: HashMap<SocksAddr, W>,
+    conn: SQConn<C>,
+    /// Key of this association's streams in the connection's stream pool.
+    association: u64,
 }
-impl<W: AsyncWrite> AssociateSendSession<W> {
-    pub async fn get_id_or_insert(&mut self, addr: &SocksAddr) -> (u16, bool) {
+impl<C: QuicConnection> AssociateSendSession<C> {
+    pub async fn get_id_or_insert(&mut self, addr: &SocksAddr) -> SResult<(u16, bool)> {
         if let Some(id) = self.dst_map.get(addr) {
-            (*id, false)
+            Ok((*id, false))
         } else {
-            let id = self.id_store.fetch_new_id(()).await;
+            let id = self.id_store.fetch_new_id(()).await?;
             self.dst_map.insert(addr.clone(), id);
             debug!(event = "squic:send_context_id_created", context_id = id, dst = %addr, "send session insert");
-            (id, true)
+            Ok((id, true))
         }
     }
 }
 
-impl<W: AsyncWrite> Drop for AssociateSendSession<W> {
+impl<C: QuicConnection> Drop for AssociateSendSession<C> {
     fn drop(&mut self) {
+        // Dropping a stream finishes it.
+        drop(self.conn.uni_pool.remove_association(self.association));
         let id_store = self.id_store.inner.clone();
         let id_remove = self.dst_map.clone();
         tokio::spawn(
@@ -480,12 +610,25 @@ pub async fn handle_udp_send<C: QuicConnection>(
     let mut session = AssociateSendSession {
         id_store: conn.send_id_store.clone(),
         dst_map: Default::default(),
-        unistream_map: Default::default(),
+        association: conn.uni_pool.new_association(),
+        conn: conn.clone(),
     };
     let quic_conn = conn.conn.clone();
     let mut trace_seq = 0_u64;
     loop {
         let (bytes, dst) = down_stream.recv_from().await?;
+        if !dst.is_encodable() {
+            // Only this datagram is lost: the association carries other
+            // destinations too.
+            static LIMIT: crate::utils::log::LogRateLimit = crate::utils::log::LogRateLimit::new();
+            if let Some(held_back) = LIMIT.allow() {
+                warn!(
+                    event = "squic:datagram_dropped",
+                    held_back, "udp datagram dropped: its destination name is too long"
+                );
+            }
+            continue;
+        }
         let should_trace = tracing::enabled!(target: "shadowquic::squic::udp", Level::TRACE) && {
             let n = trace_seq;
             trace_seq = trace_seq.wrapping_add(1);
@@ -494,7 +637,7 @@ pub async fn handle_udp_send<C: QuicConnection>(
         if should_trace {
             trace!(target: "shadowquic::squic::udp", event = "squic:downstream_datagram_received", dst = %dst, "udp datagram received from down_stream");
         }
-        let (id, is_new) = session.get_id_or_insert(&dst).await;
+        let (id, is_new) = session.get_id_or_insert(&dst).await?;
         if should_trace {
             trace!(target: "shadowquic::squic::udp", event = "squic:context_id_resolved", context_id = id, dst = %dst, "session id resolved,is_new_id:{}", is_new);
         }
@@ -504,10 +647,16 @@ pub async fn handle_udp_send<C: QuicConnection>(
             id,
         };
         let dg_header = SQPacketDatagramHeader { id };
-        if over_stream && !session.unistream_map.contains_key(&dst) {
-            let (uni, _id) = conn.open_uni().await?;
-            session.unistream_map.insert(dst.clone(), uni);
-        }
+        // A destination without a stream gets a new one, which starts with
+        // the context id, whether the id is new or not.
+        let uni = if over_stream {
+            match conn.uni_pool.take(session.association, &dst) {
+                Some(uni) => Some((uni, false)),
+                None => Some((open_uni_making_room(&conn).await?, true)),
+            }
+        } else {
+            None
+        };
 
         if is_new {
             // Need to be sent first to make it cancel safe
@@ -518,19 +667,18 @@ pub async fn handle_udp_send<C: QuicConnection>(
         }
         {
             let mut head = Vec::<u8>::new();
-            dg_header.encode(&mut head).await?;
-
-            if over_stream {
-                // Must be opened and inserted.
-                let conn = session.unistream_map.get_mut(&dst).unwrap();
-                let mut head = Vec::<u8>::new();
-                if is_new {
+            if let Some((mut uni, fresh)) = uni {
+                if fresh {
                     dg_header.encode(&mut head).await?
                 }
                 (bytes.len() as u16).encode(&mut head).await?;
-                conn.write_all(&head).await?;
-                conn.write_all(&bytes).await?;
+                uni.write_all(&head).await?;
+                uni.write_all(&bytes).await?;
+                for unused in conn.uni_pool.put(session.association, &dst, uni) {
+                    close_uni(unused).await;
+                }
             } else {
+                dg_header.encode(&mut head).await?;
                 let mut content = BytesMut::with_capacity(2000);
                 content.put(Bytes::from(head));
                 content.put(bytes);
@@ -544,6 +692,30 @@ pub async fn handle_udp_send<C: QuicConnection>(
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Opens a unidirectional stream. While the peer allows no more streams, room
+/// is made by closing streams of the connection, the least recently used first.
+async fn open_uni_making_room<C: QuicConnection>(conn: &SQConn<C>) -> SResult<C::SendStream> {
+    let open = QuicConnection::open_uni(&conn.conn);
+    tokio::pin!(open);
+    let mut patience = uni_pool::RoomPatience::new();
+    loop {
+        tokio::select! {
+            biased;
+            opened = &mut open => return Ok(opened?.0),
+            _ = patience.wait() => {
+                for unused in conn.uni_pool.take_room() {
+                    close_uni(unused).await;
+                }
+            }
+        }
+    }
+}
+
+/// Finishes a stream: the peer sees its end and allows a new one in its place.
+async fn close_uni<S: AsyncWrite + Unpin>(mut stream: S) {
+    let _ = stream.shutdown().await;
 }
 
 /// Handle udp ctrl stream receive task
@@ -583,13 +755,27 @@ pub async fn handle_udp_packet_recv<C: QuicConnection>(conn: SQConn<C>) -> Resul
     let id_store = conn.recv_id_store.clone();
     wait_sunny_auth(&conn).await?;
     let mut trace_seq = 0_u64;
+    // Armed while datagrams wait for an unannounced id, so that an idle
+    // connection has no timer.
+    let mut sweep_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
+            _ = async { tokio::time::sleep_until(sweep_at.unwrap_or_else(tokio::time::Instant::now)).await }, if sweep_at.is_some() => {
+                sweep_at = id_store
+                    .purge_expired()
+                    .await
+                    .then(|| tokio::time::Instant::now() + PENDING_TTL);
+            }
             b = conn.read_datagram() => {
                 let b = b?;
                 let b = BytesMut::from(b);
                 let mut cur = Cursor::new(b);
-                let SQPacketDatagramHeader{id} = SQPacketDatagramHeader::decode(&mut cur).await?;
+                // A datagram too short for its header is the peer's mistake, not
+                // a reason to stop UDP reception for the whole connection.
+                let Ok(SQPacketDatagramHeader{id}) = SQPacketDatagramHeader::decode(&mut cur).await else {
+                    debug!(event = "squic:datagram_dropped", "dropping malformed quic datagram");
+                    continue;
+                };
 
                 let should_trace = tracing::enabled!(target: "shadowquic::squic::udp", Level::TRACE) && {
                     let n = trace_seq;
@@ -602,7 +788,11 @@ pub async fn handle_udp_packet_recv<C: QuicConnection>(conn: SQConn<C>) -> Resul
 
                 let pos = cur.position() as usize;
                 match id_store.feed_datagram(id, cur.into_inner().split_off(pos).freeze()).await {
-                    Ok(()) => {}
+                    Ok(buffered) => {
+                        if buffered && sweep_at.is_none() {
+                            sweep_at = Some(tokio::time::Instant::now() + PENDING_TTL);
+                        }
+                    }
                     // A failed association must not stop UDP reception for the
                     // other associations sharing this QUIC connection.
                     Err(error @ SError::UdpSenderBusy(_)) => {
@@ -619,29 +809,22 @@ pub async fn handle_udp_packet_recv<C: QuicConnection>(conn: SQConn<C>) -> Resul
                 }
             }
 
-            r = async {
-                let (mut uni_stream, _id) = conn.accept_uni().await?;
+            r = conn.accept_uni() => {
+                let (mut uni_stream, _id) = r?;
                 trace!(event = "squic:unidirectional_stream_accepted", "unistream accepted");
-                let SQPacketDatagramHeader{id} = SQPacketDatagramHeader::decode(&mut uni_stream).await?;
-                trace!(event = "squic:context_resolution_started", context_id = id, "resolving datagram id");
-
-                let (udp,addr) = id_store.get_socket_or_wait(id).await?;
-
-                info!(event = "squic:udp_stream_started", context_id = id, peer_addr = %conn.remote_address(), dst = %addr, "udp over stream");
-                Ok((uni_stream,udp.clone(),addr.clone())) as Result<(C::RecvStream,AnyUdpSend,SocksAddr),SError>
-            } => {
-
-                let  (mut uni_stream,udp,addr) = match r {
-                    Ok(r) => r,
-                    Err(SError::UDPSessionClosed(_)) => {
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                };
-
+                let id_store = id_store.clone();
+                let peer_addr = conn.remote_address();
+                // Each unistream gets its own task: one that never names its
+                // context id, or names one that is never announced, must not
+                // stall the datagrams and unistreams behind it.
                 tokio::spawn(async move {
+                    let SQPacketDatagramHeader{id} = tokio::time::timeout(PENDING_TTL, SQPacketDatagramHeader::decode(&mut uni_stream))
+                        .await
+                        .map_err(|_| SError::UDPSessionClosed("udp stream sent no context id".to_string()))??;
+                    trace!(event = "squic:context_resolution_started", context_id = id, "resolving datagram id");
+                    // Gives up after `PENDING_TTL` if the id is never announced.
+                    let (udp, addr) = id_store.get_socket_or_wait(id).await?;
+                    info!(event = "squic:udp_stream_started", context_id = id, peer_addr = %peer_addr, dst = %addr, "udp over stream");
                     loop {
                         let l: usize = u16::decode(&mut uni_stream).await? as usize;
                         let mut b = BytesMut::with_capacity(l);

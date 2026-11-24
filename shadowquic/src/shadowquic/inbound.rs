@@ -35,6 +35,8 @@ struct ShadowQuicUserManager {
     endpoint: EndServer,
     config: RwLock<ShadowQuicServerCfg>,
     observer: Arc<Observer>,
+    /// Held while the user store is written.
+    persisting: tokio::sync::Mutex<()>,
 }
 
 impl ShadowQuicUserManager {
@@ -44,8 +46,11 @@ impl ShadowQuicUserManager {
         let Some(path) = config.user_store.clone() else {
             return;
         };
-        let users = config.users.clone();
         drop(config);
+        // One at a time, and the users are read after the wait: the store
+        // written last is then the newest one.
+        let _saving = self.persisting.lock().await;
+        let users = self.config.read().await.users.clone();
         let store = user_store::build_store(&users, &self.observer).await;
         if let Err(error) = user_store::save_store(&path, &store) {
             error!(
@@ -185,9 +190,7 @@ impl ShadowQuicServer {
             user_store::merge_users(&mut cfg.users, store);
         }
 
-        let endpoint: EndServer = QuicServer::new(&cfg)
-            .await
-            .expect("Failed to listening on udp");
+        let endpoint: EndServer = QuicServer::new(&cfg).await?;
         let observer = Arc::new(Observer::new());
         if let Some(store) = &store {
             observer
@@ -198,6 +201,7 @@ impl ShadowQuicServer {
             endpoint: endpoint.clone(),
             config: RwLock::new(cfg),
             observer: observer.clone(),
+            persisting: Default::default(),
         });
 
         Ok(Self {
@@ -292,35 +296,47 @@ impl Inbound for ShadowQuicServer {
         let user_manager = self.user_manager.clone();
         let tag = self.user_manager.config.read().await.tag.clone();
         let fut = async move {
-            loop {
-                match QuicServer::accept(&endpoint).await {
-                    Ok(conn) => {
-                        let request_sender = request_sender.clone();
-                        let user_manager = user_manager.clone();
-                        let span = tracing::info_span!("inbound",
-                            tag = %tag,
-                            src = tracing::field::Empty,
-                            user = tracing::field::Empty,
-                            id = tracing::field::Empty,
-                        );
-                        tokio::spawn(
-                            async move {
-                                Self::handle_incoming(conn, request_sender, user_manager)
-                                    .await
-                                    .map_err(|x| error!(event = "proxy:connection_failed", "{}", x))
+            // Each handshake runs in its own task: a handshake that fails or
+            // stalls must not delay the connections queued behind it.
+            while let Some(incoming) = endpoint.next_incoming().await {
+                let endpoint = endpoint.clone();
+                let request_sender = request_sender.clone();
+                let user_manager = user_manager.clone();
+                let span = tracing::info_span!("inbound",
+                    tag = %tag,
+                    src = tracing::field::Empty,
+                    user = tracing::field::Empty,
+                    id = tracing::field::Empty,
+                );
+                tokio::spawn(
+                    async move {
+                        let conn = match endpoint.handshake(incoming).await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                // Anyone can make handshakes fail, so this line
+                                // is rate limited.
+                                static LIMIT: crate::utils::log::LogRateLimit =
+                                    crate::utils::log::LogRateLimit::new();
+                                if let Some(held_back) = LIMIT.allow() {
+                                    error!(
+                                        event = "shadowquic:quic_connection_accept_failed",
+                                        held_back, "Error accepting quic connection: {}", e
+                                    );
+                                }
+                                return;
                             }
-                            .instrument(span),
-                        );
+                        };
+                        let _ = Self::handle_incoming(conn, request_sender, user_manager)
+                            .await
+                            .map_err(|x| error!(event = "proxy:connection_failed", "{}", x));
                     }
-                    Err(e) => {
-                        error!(
-                            event = "shadowquic:quic_connection_accept_failed",
-                            "Error accepting quic connection: {}", e
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
+                    .instrument(span),
+                );
             }
+            error!(
+                event = "shadowquic:quic_endpoint_closed",
+                "quic endpoint closed, no more connections are accepted"
+            );
         };
         tokio::spawn(fut.in_current_span());
         self.spawn_store_flush().await;

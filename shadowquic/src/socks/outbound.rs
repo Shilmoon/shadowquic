@@ -1,4 +1,4 @@
-use std::{net::ToSocketAddrs, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     TcpSession, UdpRecv, UdpSend, UdpSession,
@@ -110,22 +110,16 @@ impl SocksClient {
             ));
         }
         if let Some(username) = &self.cfg.username {
+            let password = self
+                .cfg
+                .password
+                .as_ref()
+                .ok_or(SError::SocksError("password not provided".into()))?;
+            // A name or password over 255 bytes fails to encode.
             let auth = PasswordAuthReq {
                 version: 0x01, // This is password auth version not socks version
-                username: VarVec {
-                    len: username.len() as u8,
-                    contents: username.as_bytes().to_vec(),
-                },
-                password: VarVec {
-                    len: self.cfg.password.as_ref().unwrap().len() as u8,
-                    contents: self
-                        .cfg
-                        .password
-                        .as_ref()
-                        .ok_or(SError::SocksError("password not provided".into()))?
-                        .as_bytes()
-                        .to_vec(),
-                },
+                username: VarVec::from(username.as_bytes().to_vec()),
+                password: VarVec::from(password.as_bytes().to_vec()),
             };
             auth.encode(&mut tcp).await?;
             let rep = PasswordAuthReply::decode(&mut tcp).await?;
@@ -187,13 +181,10 @@ impl SocksClient {
         let socket = self.tcp_socket_factory.create_socket().await?;
         let std_stream: std::net::TcpStream = socket.into();
         let tokio_socket = tokio::net::TcpSocket::from_std_stream(std_stream);
-        let addr = self.cfg.addr.to_socket_addrs()?.next().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "socks server address not found",
-            )
-        })?;
-        let tcp = tokio_socket.connect(addr).await?;
+        let server =
+            crate::dns::resolve_destination(&*self.addr_resolver, &self.cfg.addr.parse()?, None)
+                .await?;
+        let tcp = tokio_socket.connect(server).await?;
         tcp.set_nodelay(true)?;
 
         let mut tcp = self.authenticate(tcp).await?;
@@ -210,12 +201,19 @@ impl SocksClient {
             event = "socks:udp_association_established",
             "socks udp association established"
         );
-        let peer_addr = rep
-            .bind_addr
-            .to_socket_addrs()
-            .expect("socks server return a unresolvable address")
-            .next()
-            .expect("socks server return a unresolvable address");
+        if rep.rep != SOCKS5_REPLY_SUCCEEDED {
+            return Err(SError::SocksError(format!(
+                "UDP ASSOCIATE failed: {}",
+                rep.rep
+            )));
+        }
+        let mut peer_addr =
+            crate::dns::resolve_destination(&*self.addr_resolver, &rep.bind_addr, None).await?;
+        // A server listening on every address answers with the wildcard
+        // address and means the address it was reached at.
+        if peer_addr.ip().is_unspecified() {
+            peer_addr.set_ip(server.ip());
+        }
 
         let udp_socket_factory = UdpSocketFactory {
             addr: peer_addr.to_string(),

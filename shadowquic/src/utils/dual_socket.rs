@@ -63,8 +63,16 @@ impl DualSocket {
         };
         self.inner.send_to(buf, (ip, addr.port())).await
     }
+    /// Receives one datagram whole, whatever its size.
+    pub(crate) async fn recv_datagram(&self) -> io::Result<(bytes::Bytes, SocketAddr)> {
+        let (datagram, addr) = super::recv_udp_datagram(&self.inner).await?;
+        Ok((datagram, self.canonical_source(addr)))
+    }
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let (len, addr) = self.inner.recv_from(buf).await?;
+        Ok((len, self.canonical_source(addr)))
+    }
+    fn canonical_source(&self, addr: SocketAddr) -> SocketAddr {
         let ip = match (self.dual_stack, addr.ip()) {
             (true, ip_addr @ IpAddr::V6(ipv6_addr)) => ipv6_addr
                 .to_ipv4_mapped()
@@ -72,7 +80,7 @@ impl DualSocket {
                 .unwrap_or(ip_addr),
             (_, ip) => ip,
         };
-        Ok((len, SocketAddr::new(ip, addr.port())))
+        SocketAddr::new(ip, addr.port())
     }
 }
 

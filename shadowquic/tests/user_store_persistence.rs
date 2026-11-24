@@ -204,3 +204,76 @@ async fn user_store_periodic_flush_writes_traffic_stats() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Saves that overlap (an API call and the periodic flush) must each succeed,
+/// and a reader must never see a half-written store.
+#[test]
+fn overlapping_saves_all_succeed_and_readers_see_whole_stores() {
+    const USERS: usize = 200;
+    let path = store_path("overlapping");
+    let store = |writer: usize| UserStore {
+        users: (0..USERS)
+            .map(|i| PersistedUser {
+                username: format!("user-{writer}-{i}"),
+                password: "password".repeat(8),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    save_store(&path, &store(0)).unwrap();
+    let writers: Vec<_> = (0..8)
+        .map(|writer| {
+            let path = path.clone();
+            let store = store(writer);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    save_store(&path, &store).expect("save failed");
+                    let seen = load_store(&path).expect("unreadable store").unwrap();
+                    assert_eq!(seen.users.len(), USERS, "half-written store");
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let left_over: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|entry| entry.file_name().into_string().unwrap())
+        })
+        .filter(|name| {
+            name.starts_with(path.file_stem().unwrap().to_str().unwrap()) && name.ends_with(".tmp")
+        })
+        .collect();
+    assert!(left_over.is_empty(), "temporary files left: {left_over:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A save that was cut short, by a crash or a kill, leaves its temporary file
+/// behind, with the users' passwords in it. The next start removes it.
+#[test]
+fn temporary_files_of_an_earlier_run_are_removed_on_load() {
+    let path = store_path("stale-tmp");
+    let sibling = |suffix: &str| {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        path.with_file_name(name)
+    };
+    let orphan = sibling(".4000000000.3.tmp");
+    let own = sibling(&format!(".{}.4000000000.tmp", std::process::id()));
+    let unrelated = sibling(".notes.tmp");
+    for file in [&orphan, &own, &unrelated] {
+        std::fs::write(file, "users: []").unwrap();
+    }
+
+    assert!(load_store(&path).unwrap().is_none());
+    assert!(!orphan.exists(), "the file of an earlier run stays");
+    assert!(own.exists(), "a save of this process may be under way");
+    assert!(unrelated.exists(), "not a file of ours");
+    for file in [&own, &unrelated] {
+        let _ = std::fs::remove_file(file);
+    }
+}
